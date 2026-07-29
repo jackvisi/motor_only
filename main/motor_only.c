@@ -80,19 +80,22 @@
 #define PDO_TX_PERIOD_MS     10
 #define HEARTBEAT_TIMEOUT_MS 60000
 #define ACCEL_RAMP           5
-#define DECEL_RAMP           5
-#define ACCEL_RAMP_R          1
-#define DECEL_RAMP_R          1
-#define MAX_SETPOINT_REVERSE      1100
+#define DECEL_RAMP            5
+#define ACCEL_RAMP_R          2
+#define DECEL_RAMP_R          2
+#define MAX_SETPOINT_REVERSE      1500
 
 #define ENABLE_BTN_PIN       GPIO_NUM_11
 #define REVERSE_BTN_PIN       GPIO_NUM_10
 #define BTN_POLL_MS          30
+#define VOLT_MIN     900
 
 // Bits CommandAll
 #define CMD_SWITCH_ON   (1U << 0)
 #define CMD_ENABLE      (1U << 3)
-#define CMD_CONTACTOR   (1U << 10)
+#define CMD_CONTACTOR   (1U << 10) 
+#define REVERSE_INFO    (1U << 4)//00010000000 / 000010000
+#define ID_REVERSE   (0x112u)
 
 // Bit StatusAll
 #define ST_READY         (1U << 0)
@@ -138,7 +141,7 @@ typedef struct {
     bool     emcy_pending;
 } motor_state_t;
 
-static motor_state_t g_motor = { .target_rpm = 0, .command_word = 0, .enabled = false, .reverse = false, .cruise_active = false };  // first initialization
+static motor_state_t g_motor = { .target_rpm = 0, .command_word = 0, .enabled = false, .reverse = false, .cruise_active = false, .filtered_voltage = 0 };  // first initialization
 static SemaphoreHandle_t g_state_mutex;        //mutex
 
 // -----------------------------------   ADC/lvr --------------------------
@@ -181,7 +184,7 @@ static void IRAM_ATTR ad7190_rdy_isr_handler(void *arg)
 // 100 setpoints 45rpm resolution
 // setpoint = sample * max_setpoint/max_sample 
 
-volatile int16_t max_setpoint = 3000;  //max rpm
+volatile int16_t max_setpoint = 4500;  //max rpm
 int16_t setpoint = 0;
 
 static esp_err_t ad7190_rdy_gpio_init(void)
@@ -301,7 +304,7 @@ static void ad7190_task_lever(void *pvParameters)
         .enpar = false,
         .single_cycle = false,
         .rej60 = false,
-        .fs = 800,
+        .fs = 350,
     };
 
     // LEVER CONFIG
@@ -555,6 +558,7 @@ void pdo_tx_task(void *arg) {
         int16_t  rpm = g_motor.target_rpm;
         bool     en  = g_motor.enabled; 
         bool rev = g_motor.reverse;
+        int16_t  volt = g_motor.filtered_voltage;
         xSemaphoreGive(g_state_mutex);
         if (en) {
             if (rev){
@@ -565,6 +569,15 @@ void pdo_tx_task(void *arg) {
                 };
                 memset(buf, 0, 8); gvi_motor_commands1_rx_pdo1_pack(buf, &c1, 8);
                 send_pdo(GVI_MOTOR_COMMANDS1_RX_PDO1_FRAME_ID, buf, GVI_MOTOR_COMMANDS1_RX_PDO1_LENGTH);
+
+                struct gvi_motor_commands1_rx_pdo1_t reverse = {
+                    .commands_all = REVERSE_INFO, .command_speed = 0,
+                    .command_acceleration_change = 0,
+                    .command_deceleration_change = 0,
+                };
+                memset(buf, 0, 8); gvi_motor_commands1_rx_pdo1_pack(buf, &reverse, 8);
+                send_pdo(ID_REVERSE, buf, GVI_MOTOR_COMMANDS1_RX_PDO1_LENGTH);
+
             } else{
                 struct gvi_motor_commands1_rx_pdo1_t c1 = {
                     .commands_all = cmd, .command_speed = rpm,
@@ -573,18 +586,36 @@ void pdo_tx_task(void *arg) {
                 };
                 memset(buf, 0, 8); gvi_motor_commands1_rx_pdo1_pack(buf, &c1, 8);
                 send_pdo(GVI_MOTOR_COMMANDS1_RX_PDO1_FRAME_ID, buf, GVI_MOTOR_COMMANDS1_RX_PDO1_LENGTH);
+
+                struct gvi_motor_commands1_rx_pdo1_t reverse = {
+                    .commands_all = 0, .command_speed = 0,
+                    .command_acceleration_change = 0,
+                    .command_deceleration_change = 0,
+                };
+                memset(buf, 0, 8); gvi_motor_commands1_rx_pdo1_pack(buf, &reverse, 8);
+                send_pdo(ID_REVERSE, buf, GVI_MOTOR_COMMANDS1_RX_PDO1_LENGTH);
             }
             
             struct gvi_motor_commands2_rx_pdo2_t c2 = { .requested_control_mode = 0 };
             memset(buf, 0, 8); gvi_motor_commands2_rx_pdo2_pack(buf, &c2, 8);
             send_pdo(GVI_MOTOR_COMMANDS2_RX_PDO2_FRAME_ID, buf, GVI_MOTOR_COMMANDS2_RX_PDO2_LENGTH);
 
+            int16_t volt_safe = volt;
+            if (volt_safe < VOLT_MIN) volt_safe = VOLT_MIN;   // evita zero e negativi
+            double volt_real = (double)volt_safe * 0.1;
+            double current_limit = 24000.0 / (double)volt_real;
+
+            if (current_limit > 400) {current_limit = 400.0;}
+            //ESP_LOGI("PWRLIM", "Current Limit: %.3f",current_limit);
             struct gvi_motor_limits_rx_pdo3_t lim = {
                 .acc_torque_limit = gvi_motor_limits_rx_pdo3_acc_torque_limit_encode(70), .brake_torque_limit = gvi_motor_limits_rx_pdo3_brake_torque_limit_encode(70),
-                .pos_dc_current_limit = gvi_motor_limits_rx_pdo3_pos_dc_current_limit_encode(400), .neg_dc_current_limit = gvi_motor_limits_rx_pdo3_neg_dc_current_limit_encode(400),
+                .pos_dc_current_limit = gvi_motor_limits_rx_pdo3_pos_dc_current_limit_encode(current_limit), .neg_dc_current_limit = gvi_motor_limits_rx_pdo3_neg_dc_current_limit_encode(current_limit),
             };
+            //ESP_LOGI("PWRLIM", "Current Limit after encode: %d",gvi_motor_limits_rx_pdo3_pos_dc_current_limit_encode(current_limit));
             memset(buf, 0, 8); gvi_motor_limits_rx_pdo3_pack(buf, &lim, 8);
             send_pdo(GVI_MOTOR_LIMITS_RX_PDO3_FRAME_ID, buf, GVI_MOTOR_LIMITS_RX_PDO3_LENGTH);
+
+
         }
         vTaskDelayUntil(&last, pdMS_TO_TICKS(PDO_TX_PERIOD_MS));
     }
