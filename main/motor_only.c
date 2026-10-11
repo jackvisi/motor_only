@@ -22,7 +22,7 @@
 #include "batteries.h"
 
 //  lvrd
-#include "components/ad7124/ad7190.h"
+#include "ad7190.h"
 #include "components/drivers/cooling.h"
 //adc defines 
 #define AD7190_CLK_PIN 35
@@ -159,7 +159,7 @@ static void IRAM_ATTR ad7190_rdy_isr_handler(void *arg)
 
     gpio_intr_disable(AD7190_RDY_GPIO);
 
-    if (ad7190_read_data(&sample) == ESP_OK) {
+    if (ad7190_conversion_read(&sample) == ESP_OK) {
         s_last_sample = sample;
         s_sample_ready = true;
     }
@@ -353,7 +353,7 @@ static void ad7190_task_lever(void *pvParameters)
 
 
     // START CONVERSION
-    ad7190_start_contread();
+    ad7190_continuous_read_start();
 
     while (1) {
 
@@ -375,7 +375,7 @@ static void ad7190_task_lever(void *pvParameters)
         uint32_t sample = 0;
 
         gpio_intr_disable(AD7190_RDY_GPIO);
-        err = ad7190_read_data(&sample);
+        err = ad7190_conversion_read(&sample);
         gpio_intr_enable(AD7190_RDY_GPIO);
 
         if (err != ESP_OK) {
